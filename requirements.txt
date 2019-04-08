@@ -1,0 +1,7 @@
+ecdsa>=0.9
+mnemonic>=0.17
+requests>=2.4.0
+click>=6.2
+pyblake2>=0.9.3
+pip>=6
+typing>=3.0.0; python_version < '3.5'

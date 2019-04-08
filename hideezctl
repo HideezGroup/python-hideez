@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+
+# This file is part of the TREZOR project.
+#
+# Copyright (C) 2012-2017 Marek Palatinus <slush@satoshilabs.com>
+# Copyright (C) 2012-2017 Pavol Rusnak <stick@satoshilabs.com>
+# Copyright (C) 2016-2017 Jochen Hoenicke <hoenicke@gmail.com>
+# Copyright (C) 2017      mruddy
+# Copyright (C) 2019      Drynode
+#
+# This library is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Lesser General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This library is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Lesser General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with this library.  If not, see <http://www.gnu.org/licenses/>.
+
+import base64
+import binascii
+import click
+import json
+import os
+import sys
+
+from hideezlib.client import HideezClient
+from hideezlib.transport import get_transport, enumerate_devices
+from hideezlib import coins
+from hideezlib import log
+from hideezlib import messages as proto
+from hideezlib import protobuf
+from hideezlib import tools
+
+
+class ChoiceType(click.Choice):
+    def __init__(self, typemap):
+        super(ChoiceType, self).__init__(typemap.keys())
+        self.typemap = typemap
+
+    def convert(self, value, param, ctx):
+        value = super(ChoiceType, self).convert(value, param, ctx)
+        return self.typemap[value]
+
+
+CHOICE_INPUT_SCRIPT_TYPE = ChoiceType({
+    'address':    proto.InputScriptType.SPENDADDRESS,
+    'segwit':     proto.InputScriptType.SPENDWITNESS,
+    'p2shsegwit': proto.InputScriptType.SPENDP2SHWITNESS,
+})
+
+
+CHOICE_OUTPUT_SCRIPT_TYPE = ChoiceType({
+    'address':    proto.OutputScriptType.PAYTOADDRESS,
+    'segwit':     proto.OutputScriptType.PAYTOWITNESS,
+    'p2shsegwit': proto.OutputScriptType.PAYTOP2SHWITNESS,
+})
+
+
+def enable_logging():
+    log.enable_debug_output()
+    log.OMITTED_MESSAGES.add(proto.Features)
+
+
+@click.group(context_settings={'max_content_width': 400})
+@click.option('-p', '--path', help='Select device by specific path.',
+              default=os.environ.get('HIDEEZ_PATH'))
+@click.option('-v', '--verbose', is_flag=True,
+              help='Show communication messages.')
+@click.option('-j', '--json', 'is_json', is_flag=True,
+              help='Print result as JSON object')
+@click.pass_context
+def cli(ctx, path, verbose, is_json):
+    if verbose:
+        enable_logging()
+
+    def get_device():
+        try:
+            device = get_transport(path, prefix_search=False)
+        except Exception:
+            try:
+                device = get_transport(path, prefix_search=True)
+            except Exception:
+                click.echo("Failed to find a Hideez device.")
+                if path is not None:
+                    click.echo("Using path: {}".format(path))
+                sys.exit(1)
+        return HideezClient(transport=device)
+
+    ctx.obj = get_device
+
+
+@cli.resultcallback()
+def print_result(res, path, verbose, is_json):
+    if is_json:
+        if isinstance(res, protobuf.MessageType):
+            click.echo(json.dumps({res.__class__.__name__: res.__dict__}))
+        else:
+            click.echo(json.dumps(res, sort_keys=True, indent=4))
+    else:
+        if isinstance(res, list):
+            for line in res:
+                click.echo(line)
+        elif isinstance(res, dict):
+            for k, v in res.items():
+                if isinstance(v, dict):
+                    for kk, vv in v.items():
+                        click.echo('%s.%s: %s' % (k, kk, vv))
+                else:
+                    click.echo('%s: %s' % (k, v))
+        elif isinstance(res, protobuf.MessageType):
+            click.echo(protobuf.format_message(res))
+        else:
+            click.echo(res)
+
+
+@cli.command(name='list', help='List connected Hideez devices.')
+def ls():
+    return enumerate_devices()
+
+
+@cli.command(help='Show version of hideezctl/hideezlib.')
+def version():
+    from hideezlib import __version__ as VERSION
+    return VERSION
+
+
+@cli.command(help='Send ping message.')
+@click.argument('message')
+@click.option('-b', '--button-protection', is_flag=True)
+@click.option('-p', '--pin-protection', is_flag=True)
+@click.option('-r', '--passphrase-protection', is_flag=True)
+@click.pass_obj
+def ping(connect, message, button_protection,
+         pin_protection, passphrase_protection):
+    return connect().ping(message, button_protection=button_protection,
+                          pin_protection=pin_protection,
+                          passphrase_protection=passphrase_protection)
+
+
+@cli.command(help='Clear session (remove cached PIN, passphrase, etc.).')
+@click.pass_obj
+def clear_session(connect):
+    return connect().clear_session()
+
+
+@cli.command(help='Retrieve device features and settings.')
+@click.pass_obj
+def get_features(connect):
+    return connect().features
+
+
+@cli.command(help='Get address for specified path.')
+@click.option('-c', '--coin', default='Bitcoin')
+@click.option('-n', '--address', required=True,
+              help="BIP-32 path, e.g. m/44'/0'/0'/0/0")
+@click.option('-t', '--script-type', type=CHOICE_INPUT_SCRIPT_TYPE,
+              default='address')
+@click.option('-d', '--show-display', is_flag=True)
+@click.pass_obj
+def get_address(connect, coin, address, script_type, show_display):
+    client = connect()
+    address_n = tools.parse_path(address)
+    return client.get_address(coin, address_n, show_display,
+                              script_type=script_type)
+
+
+@cli.command(help='Get public node of given path.')
+@click.option('-c', '--coin', default='Bitcoin')
+@click.option('-n', '--address', required=True,
+              help="BIP-32 path, e.g. m/44'/0'/0'")
+@click.option('-e', '--curve')
+@click.option('-d', '--show-display', is_flag=True)
+@click.pass_obj
+def get_public_node(connect, coin, address, curve, show_display):
+    client = connect()
+    address_n = tools.parse_path(address)
+    result = client.get_public_node(address_n, ecdsa_curve_name=curve,
+                                    show_display=show_display, coin_name=coin)
+    return {
+        'node': {
+            'depth': result.node.depth,
+            'fingerprint': "%08x" % result.node.fingerprint,
+            'child_num': result.node.child_num,
+            'chain_code': binascii.hexlify(result.node.chain_code),
+            'public_key': binascii.hexlify(result.node.public_key),
+        },
+        'xpub': result.xpub
+    }
+
+
+@cli.command(help='Sign transaction.')
+@click.option('-c', '--coin', default='Bitcoin')
+@click.pass_obj
+def sign_tx(connect, coin):
+    client = connect()
+    if coin in coins.tx_api:
+        txapi = coins.tx_api[coin]
+    else:
+        click.echo('Coin "%s" is not recognized.' % coin, err=True)
+        click.echo('Supported coin types: %s' % ', '.join(coins.tx_api.keys()),
+                   err=True)
+        sys.exit(1)
+
+    client.set_tx_api(txapi)
+
+    def default_script_type(address_n):
+        script_type = 'address'
+
+        if address_n is None:
+            pass
+        elif address_n[0] == tools.H_(49):
+            script_type = 'p2shsegwit'
+
+        return script_type
+
+    def outpoint(s):
+        txid, vout = s.split(':')
+        return binascii.unhexlify(txid), int(vout)
+
+    inputs = []
+    while True:
+        click.echo()
+        prev = click.prompt('Previous output to spend (txid:vout)',
+                            type=outpoint, default='')
+        if not prev:
+            break
+        prev_hash, prev_index = prev
+        address_n = click.prompt('BIP-32 path to derive the key',
+                                 type=tools.parse_path)
+        amount = click.prompt('Input amount (satoshis)', type=int, default=0)
+        sequence = click.prompt('Sequence Number to use (RBF opt-in enabled '
+                                'by default)', type=int, default=0xfffffffd)
+        script_type = click.prompt('Input type', type=CHOICE_INPUT_SCRIPT_TYPE,
+                                   default=default_script_type(address_n))
+        if not isinstance(script_type, int):
+            script_type = CHOICE_INPUT_SCRIPT_TYPE.typemap[script_type]
+        inputs.append(proto.TxInputType(
+            address_n=address_n,
+            prev_hash=prev_hash,
+            prev_index=prev_index,
+            amount=amount,
+            script_type=script_type,
+            sequence=sequence,
+        ))
+
+    outputs = []
+    while True:
+        click.echo()
+        address = click.prompt('Output address (for non-change output)',
+                               default='')
+        if address:
+            address_n = None
+        else:
+            address = None
+            address_n = click.prompt('BIP-32 path (for change output)',
+                                     type=tools.parse_path, default='')
+            if not address_n:
+                break
+        amount = click.prompt('Amount to spend (satoshis)', type=int)
+        script_type = click.prompt('Output type',
+                                   type=CHOICE_OUTPUT_SCRIPT_TYPE,
+                                   default=default_script_type(address_n))
+        if not isinstance(script_type, int):
+            script_type = CHOICE_OUTPUT_SCRIPT_TYPE.typemap[script_type]
+        outputs.append(proto.TxOutputType(
+            address_n=address_n,
+            address=address,
+            amount=amount,
+            script_type=script_type,
+        ))
+
+    tx_version = click.prompt('Transaction version', type=int, default=2)
+    tx_locktime = click.prompt('Transaction locktime', type=int, default=0)
+
+    _, serialized_tx = client.sign_tx(coin, inputs, outputs, tx_version,
+                                      tx_locktime)
+
+    client.close()
+
+    click.echo()
+    click.echo('Signed Transaction:')
+    click.echo(binascii.hexlify(serialized_tx))
+    click.echo()
+    click.echo('Use the following form to broadcast it to the network:')
+    click.echo(txapi.pushtx_url)
+
+
+@cli.command(help='Sign message using address of given path.')
+@click.option('-c', '--coin', default='Bitcoin')
+@click.option('-n', '--address', required=True,
+              help="BIP-32 path, e.g. m/44'/0'/0'/0/0")
+@click.option('-t', '--script-type',
+              type=click.Choice(['address', 'segwit', 'p2shsegwit']),
+              default='address')
+@click.argument('message')
+@click.pass_obj
+def sign_message(connect, coin, address, message, script_type):
+    client = connect()
+    address_n = tools.parse_path(address)
+    typemap = {
+        'address': proto.InputScriptType.SPENDADDRESS,
+        'segwit': proto.InputScriptType.SPENDWITNESS,
+        'p2shsegwit': proto.InputScriptType.SPENDP2SHWITNESS,
+    }
+    script_type = typemap[script_type]
+    res = client.sign_message(coin, address_n, message, script_type)
+    return {
+        'message': message,
+        'address': res.address,
+        'signature': base64.b64encode(res.signature)
+    }
+
+
+@cli.command(help='Verify message.')
+@click.option('-c', '--coin', default='Bitcoin')
+@click.argument('address')
+@click.argument('signature')
+@click.argument('message')
+@click.pass_obj
+def verify_message(connect, coin, address, signature, message):
+    signature = base64.b64decode(signature)
+    return connect().verify_message(coin, address, signature, message)
+
+
+@cli.command(help='Encrypt value by given key and path.')
+@click.option('-n', '--address', required=True,
+              help="BIP-32 path, e.g. m/10016'/0")
+@click.argument('key')
+@click.argument('value')
+@click.pass_obj
+def encrypt_keyvalue(connect, address, key, value):
+    client = connect()
+    address_n = tools.parse_path(address)
+    res = client.encrypt_keyvalue(address_n, key, value.encode())
+    return binascii.hexlify(res)
+
+
+@cli.command(help='Decrypt value by given key and path.')
+@click.option('-n', '--address', required=True,
+              help="BIP-32 path, e.g. m/10016'/0")
+@click.argument('key')
+@click.argument('value')
+@click.pass_obj
+def decrypt_keyvalue(connect, address, key, value):
+    client = connect()
+    address_n = tools.parse_path(address)
+    return client.decrypt_keyvalue(address_n, key, binascii.unhexlify(value))
+
+
+@cli.command(help='Encrypt message.')
+@click.option('-c', '--coin', default='Bitcoin')
+@click.option('-d', '--display-only', is_flag=True)
+@click.option('-n', '--address', required=True,
+              help="BIP-32 path, e.g. m/44'/0'/0'/0/0")
+@click.argument('pubkey')
+@click.argument('message')
+@click.pass_obj
+def encrypt_message(connect, coin, display_only, address, pubkey, message):
+    client = connect()
+    pubkey = binascii.unhexlify(pubkey)
+    address_n = tools.parse_path(address)
+    res = client.encrypt_message(pubkey, message, display_only, coin,
+                                 address_n)
+    return {
+        'nonce': binascii.hexlify(res.nonce),
+        'message': binascii.hexlify(res.message),
+        'hmac': binascii.hexlify(res.hmac),
+        'payload': base64.b64encode(res.nonce + res.message + res.hmac),
+    }
+
+
+@cli.command(help='Decrypt message.')
+@click.option('-n', '--address', required=True,
+              help="BIP-32 path, e.g. m/44'/0'/0'/0/0")
+@click.argument('payload')
+@click.pass_obj
+def decrypt_message(connect, address, payload):
+    client = connect()
+    address_n = tools.parse_path(address)
+    payload = base64.b64decode(payload)
+    nonce, message, msg_hmac = payload[:33], payload[33:-8], payload[-8:]
+    return client.decrypt_message(address_n, nonce, message, msg_hmac)
+
+
+@cli.command(help='Ask device to commit to CoSi signing.')
+@click.option('-n', '--address', required=True,
+              help="BIP-32 path, e.g. m/44'/0'/0'/0/0")
+@click.argument('data')
+@click.pass_obj
+def cosi_commit(connect, address, data):
+    client = connect()
+    address_n = tools.parse_path(address)
+    return client.cosi_commit(address_n, binascii.unhexlify(data))
+
+
+@cli.command(help='Ask device to sign using CoSi.')
+@click.option('-n', '--address', required=True,
+              help="BIP-32 path, e.g. m/44'/0'/0'/0/0")
+@click.argument('data')
+@click.argument('global_commitment')
+@click.argument('global_pubkey')
+@click.pass_obj
+def cosi_sign(connect, address, data, global_commitment, global_pubkey):
+    client = connect()
+    address_n = tools.parse_path(address)
+    return client.cosi_sign(address_n, binascii.unhexlify(data),
+                            binascii.unhexlify(global_commitment),
+                            binascii.unhexlify(global_pubkey))
+
+
+if __name__ == '__main__':
+    cli()
